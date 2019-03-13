@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"regexp"
 	"sort"
@@ -42,13 +43,17 @@ var color = goterm.WHITE
 
 func main() {
 	var inv bool
+	var verbose bool
+	var mode string
 	var cut int
 	var groups stringsFlags
 	var codes ints64Flags
+	flag.BoolVar(&verbose, "v", false, "verbose mode")
+	flag.BoolVar(&inv, "i", false, "invert foreground print color")
+	flag.StringVar(&mode, "mode", "url", "how to organize hits url|ua")
+	flag.IntVar(&cut, "cut", 0, "cut some caracters from the beginning of each line")
 	flag.Var(&groups, "group", "url group regexp such as [name]=[re]")
 	flag.Var(&codes, "code", "only those http codes (comma split)")
-	flag.BoolVar(&inv, "i", false, "invert foreground print color")
-	flag.IntVar(&cut, "cut", 0, "cut some caracters from the beginning of each line")
 	flag.Parse()
 
 	if inv {
@@ -59,10 +64,12 @@ func main() {
 	go read(stdin, os.Stdin)
 
 	srv := serverProcesser{
-		cut:    cut,
-		groups: map[string]*regexp.Regexp{},
-		only:   map[string]struct{}{},
-		stats:  map[string]httpStat{},
+		mode:    mode,
+		cut:     cut,
+		verbose: verbose,
+		groups:  map[string]*regexp.Regexp{},
+		only:    map[string]struct{}{},
+		stats:   map[string]httpStat{},
 	}
 
 	for _, g := range groups {
@@ -76,15 +83,15 @@ func main() {
 		srv.only[c] = struct{}{}
 	}
 
-	secondTicker := time.Tick(time.Second)
+	ticker := time.Tick(time.Millisecond * 100)
 	for {
 		select {
+		case <-ticker:
+			printJobs(srv.Stats())
+			<-time.After(time.Millisecond)
 		case line := <-stdin:
 			srv.Process(line)
-		case <-secondTicker:
-			printJobs(srv.Stats())
 		}
-		<-time.After(time.Millisecond)
 	}
 }
 
@@ -94,21 +101,36 @@ func read(dst chan []byte, src io.Reader) {
 	for sc.Scan() {
 		dst <- sc.Bytes()
 	}
-	panic("r")
 }
 
 type serverProcesser struct {
-	cut    int
-	groups map[string]*regexp.Regexp
-	only   map[string]struct{}
-	stats  map[string]httpStat
+	cut     int
+	mode    string
+	verbose bool
+	groups  map[string]*regexp.Regexp
+	only    map[string]struct{}
+	stats   map[string]httpStat
+}
+
+type LogLine struct {
+	RemoteAddr string
+	Username   string
+	Date       string
+	Method     string
+	Query      string
+	Path       string
+	Proto      string
+	Code       string
+	Length     string
+	Host       string
+	UA         string
 }
 
 var doubleDash = []byte("--")
 var dash = []byte("-")
 var bracket = []byte("]")
 var ws = []byte(" ")
-var backslash = []byte("\"")
+var quote = []byte("\"")
 
 func indexOf(b []byte, startAt int, search []byte) int {
 	if len(b) < startAt || startAt < 0 {
@@ -117,99 +139,142 @@ func indexOf(b []byte, startAt int, search []byte) int {
 	return bytes.Index(b[startAt:], search)
 }
 
-func (s serverProcesser) Parse(line []byte) ([]byte, []byte) {
-	if len(line) < s.cut {
-		return nil, nil
+func parse(cut int, line []byte) (ret LogLine, err error) {
+	if len(line) < cut {
+		return ret, fmt.Errorf("line smaller than cut")
 	}
-	line = line[s.cut:]
+	line = line[cut:]
 	if len(line) < 55 {
-		return nil, nil
+		return ret, fmt.Errorf("line smaller than 55")
 	}
 	if bytes.HasPrefix(line, doubleDash) {
-		return nil, nil
+		return ret, fmt.Errorf("comment")
 	}
 	curPos := 0
 	//pass ip
 	if u := indexOf(line, curPos, dash); u > -1 {
+		ret.RemoteAddr = string(line[curPos : curPos+u])
+		ret.RemoteAddr = strings.TrimSpace(ret.RemoteAddr)
 		curPos += u + 1 + 1 // dash + ws
 	} else {
-		return nil, nil
+		return ret, fmt.Errorf("ip not found")
 	}
 	//pass username
 	if u := indexOf(line, curPos, dash); u > -1 {
+		ret.Username = string(line[curPos : curPos+u])
+		ret.Username = strings.TrimSpace(ret.Username)
 		curPos += u + 1 + 1 // dash + ws
 	} else {
-		return nil, nil
+		return ret, fmt.Errorf("username not found")
 	}
 	//pass date
 	if u := indexOf(line, curPos, bracket); u > -1 {
+		ret.Date = string(line[curPos+1 : curPos+u])
 		curPos += u + 1 + 1 // bracket + ws
 	} else {
-		return nil, nil
+		return ret, fmt.Errorf("date not found")
 	}
 	//pass method
 	if u := indexOf(line, curPos, ws); u > -1 {
+		ret.Method = string(line[curPos : curPos+u])
+		ret.Method = strings.Trim(ret.Method, "\"")
 		curPos += u + 1 // ws
 	} else {
-		return nil, nil
+		return ret, fmt.Errorf("method not found")
 	}
-	// path
-	var path []byte
 	if u := indexOf(line, curPos, ws); u > -1 {
-		if curPos+u < len(line) {
-			path = append(path, line[curPos:curPos+u]...)
-		}
+		ret.Path = string(line[curPos : curPos+u])
 		curPos += u + 1 // ws
 	} else {
-		return nil, nil
+		return ret, fmt.Errorf("path not found")
 	}
 	//pass proto
 	if u := indexOf(line, curPos, ws); u > -1 {
+		ret.Proto = string(line[curPos : curPos+u])
+		ret.Proto = strings.TrimSpace(ret.Proto)
+		ret.Proto = strings.Trim(ret.Proto, "\"")
 		curPos += u + 1 // ws
 	} else {
-		return nil, nil
+		return ret, fmt.Errorf("proto not found")
 	}
-	// code
-	var code []byte
 	if u := indexOf(line, curPos, ws); u > -1 {
-		if curPos+u < len(line) {
-			code = append(code, line[curPos:curPos+u]...)
-		}
+		ret.Code = string(line[curPos : curPos+u])
+		ret.Code = strings.Trim(ret.Code, "\"")
 		curPos += u + 1 // ws
 	} else {
-		return nil, nil
+		return ret, fmt.Errorf("code not found")
 	}
-	return path, bytes.Trim(code, "\"")
+	if u := indexOf(line, curPos, ws); u > -1 {
+		ret.Length = string(line[curPos : curPos+u])
+		ret.Length = strings.TrimSpace(ret.Length)
+		curPos += u + 1 // ws
+	} else if curPos < len(line) {
+		ret.Length = string(line[curPos:])
+		ret.Length = strings.TrimSpace(ret.Length)
+		return ret, nil
+	} else {
+		return ret, fmt.Errorf("length not found")
+	}
+
+	if u := indexOf(line, curPos+1, quote); u > -1 {
+		ret.Host = string(line[curPos+1 : curPos+u+1])
+		curPos += 1 + u + 1 // quote
+	} else {
+		return ret, fmt.Errorf("host not found")
+	}
+	/*
+	 */
+	if u := indexOf(line, curPos+1+1, quote); u > -1 {
+		ret.UA = string(line[curPos+1+1 : curPos+u+1+1])
+		ret.UA = strings.TrimSpace(ret.UA)
+		ret.UA = strings.Trim(ret.UA, "\"")
+	} else if curPos < len(line) {
+		ret.UA = string(line[curPos:])
+		ret.UA = strings.TrimSpace(ret.UA)
+		ret.UA = strings.Trim(ret.UA, "\"")
+		return ret, nil
+	} else {
+		return ret, fmt.Errorf("ua not found")
+	}
+	return ret, nil
 }
 
 func (s serverProcesser) Process(line []byte) {
-	path, code := s.Parse(line)
-	if path == nil || code == nil {
+	parsed, err := parse(s.cut, line)
+	if err != nil {
+		if s.verbose {
+			log.Println(err, string(line))
+		}
 		return
 	}
-	spath := strings.TrimSpace(string(path))
-	scode := strings.Trim(string(code), " \"")
 
-	if len(spath) < 1 {
+	var by string
+	if s.mode == "url" {
+		by = parsed.Path
+	} else if s.mode == "ua" {
+		by = parsed.UA
+	}
+
+	if len(by) < 1 {
 		return
 	}
-	if len(scode) < 1 {
+	if len(parsed.Code) < 1 {
 		return
 	}
 
 	if len(s.groups) == 0 {
-		httpStatsMap(s.stats).AddStat(spath, scode)
+		httpStatsMap(s.stats).AddStat(by, parsed.Code)
 		return
 	}
 
 	for n, re := range s.groups {
-		if re.Match(path) {
-			httpStatsMap(s.stats).AddStat(n, scode)
+		if re.MatchString(by) {
+			httpStatsMap(s.stats).AddStat(n, parsed.Code)
 			return
 		}
 	}
 
-	httpStatsMap(s.stats).AddStat(spath, scode)
+	httpStatsMap(s.stats).AddStat(by, parsed.Code)
 	return
 }
 func (s serverProcesser) Stats() []httpStat {

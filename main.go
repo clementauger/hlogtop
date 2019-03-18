@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/buger/goterm"
@@ -45,12 +46,14 @@ func main() {
 	var inv bool
 	var verbose bool
 	var mode string
+	var dateFormat string
 	var cut int
 	var groups stringsFlags
 	var codes ints64Flags
 	flag.BoolVar(&verbose, "v", false, "verbose mode")
 	flag.BoolVar(&inv, "i", false, "invert foreground print color")
-	flag.StringVar(&mode, "mode", "url", "how to organize hits url|ua")
+	flag.StringVar(&mode, "mode", "url", "how to organize hits url|ua|date")
+	flag.StringVar(&dateFormat, "format", "YYYY-MM-DD", "date formatting")
 	flag.IntVar(&cut, "cut", 0, "cut some caracters from the beginning of each line")
 	flag.Var(&groups, "group", "url group regexp such as [name]=[re]")
 	flag.Var(&codes, "code", "only those http codes (comma split)")
@@ -63,13 +66,34 @@ func main() {
 	stdin := make(chan []byte)
 	go read(stdin, os.Stdin)
 
+	lines := make(chan LogLine)
+	workers := 4
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			parseLines(cut, verbose, lines, stdin)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(lines)
+	}()
+
+	dateFormat = strings.Replace(dateFormat, "YYYY", "2006", -1)
+	dateFormat = strings.Replace(dateFormat, "MM", "01", -1)
+	dateFormat = strings.Replace(dateFormat, "DD", "02", -1)
+	dateFormat = strings.Replace(dateFormat, "hh", "15", -1)
+	dateFormat = strings.Replace(dateFormat, "mm", "54", -1)
+	dateFormat = strings.Replace(dateFormat, "ii", "05", -1)
+
 	srv := serverProcesser{
-		mode:    mode,
-		cut:     cut,
-		verbose: verbose,
-		groups:  map[string]*regexp.Regexp{},
-		only:    map[string]struct{}{},
-		stats:   map[string]httpStat{},
+		mode:       mode,
+		dateFormat: dateFormat,
+		groups:     map[string]*regexp.Regexp{},
+		only:       map[string]struct{}{},
+		stats:      map[string]httpStat{},
 	}
 
 	for _, g := range groups {
@@ -83,15 +107,15 @@ func main() {
 		srv.only[c] = struct{}{}
 	}
 
-	ticker := time.Tick(time.Millisecond * 100)
+	ticker := time.Tick(time.Millisecond * 500)
 	for {
 		select {
 		case <-ticker:
 			printJobs(srv.Stats())
-			<-time.After(time.Millisecond)
-		case line := <-stdin:
+		case line := <-lines:
 			srv.Process(line)
 		}
+		<-time.After(time.Microsecond * 100)
 	}
 }
 
@@ -103,13 +127,25 @@ func read(dst chan []byte, src io.Reader) {
 	}
 }
 
+func parseLines(cut int, verbose bool, dst chan LogLine, src chan []byte) {
+	for line := range src {
+		parsed, err := Parse(cut, line)
+		if err != nil {
+			if verbose {
+				log.Println(err, string(line))
+			}
+			continue
+		}
+		dst <- parsed
+	}
+}
+
 type serverProcesser struct {
-	cut     int
-	mode    string
-	verbose bool
-	groups  map[string]*regexp.Regexp
-	only    map[string]struct{}
-	stats   map[string]httpStat
+	mode       string
+	dateFormat string
+	groups     map[string]*regexp.Regexp
+	only       map[string]struct{}
+	stats      map[string]httpStat
 }
 
 type LogLine struct {
@@ -139,7 +175,7 @@ func indexOf(b []byte, startAt int, search []byte) int {
 	return bytes.Index(b[startAt:], search)
 }
 
-func parse(cut int, line []byte) (ret LogLine, err error) {
+func Parse(cut int, line []byte) (ret LogLine, err error) {
 	if len(line) < cut {
 		return ret, fmt.Errorf("line smaller than cut")
 	}
@@ -239,42 +275,40 @@ func parse(cut int, line []byte) (ret LogLine, err error) {
 	return ret, nil
 }
 
-func (s serverProcesser) Process(line []byte) {
-	parsed, err := parse(s.cut, line)
-	if err != nil {
-		if s.verbose {
-			log.Println(err, string(line))
-		}
-		return
-	}
-
+func (s serverProcesser) Process(line LogLine) {
 	var by string
 	if s.mode == "url" {
-		by = parsed.Path
+		by = line.Path
 	} else if s.mode == "ua" {
-		by = parsed.UA
+		by = line.UA
+	} else if s.mode == "date" {
+		x, err := time.Parse("02/Jan/2006:15:04:05 -0700", line.Date)
+		if err != nil {
+			return
+		}
+		by = x.Format(s.dateFormat)
 	}
 
 	if len(by) < 1 {
 		return
 	}
-	if len(parsed.Code) < 1 {
+	if len(line.Code) < 1 {
 		return
 	}
 
 	if len(s.groups) == 0 {
-		httpStatsMap(s.stats).AddStat(by, parsed.Code)
+		httpStatsMap(s.stats).AddStat(by, line.Code)
 		return
 	}
 
 	for n, re := range s.groups {
 		if re.MatchString(by) {
-			httpStatsMap(s.stats).AddStat(n, parsed.Code)
+			httpStatsMap(s.stats).AddStat(n, line.Code)
 			return
 		}
 	}
 
-	httpStatsMap(s.stats).AddStat(by, parsed.Code)
+	httpStatsMap(s.stats).AddStat(by, line.Code)
 	return
 }
 func (s serverProcesser) Stats() []httpStat {

@@ -44,7 +44,7 @@ func TestCommonFormat(t *testing.T) {
 	}
 
 	for _, e := range expects {
-		line, err := parse(0, []byte(e.in))
+		line, err := Parse(0, []byte(e.in))
 		if err != nil {
 			t.Log(err)
 		}
@@ -92,7 +92,7 @@ func TestCominedFormat(t *testing.T) {
 	}
 
 	for _, e := range expects {
-		line, err := parse(0, []byte(e.in))
+		line, err := Parse(0, []byte(e.in))
 		if err != nil {
 			t.Log(err)
 		}

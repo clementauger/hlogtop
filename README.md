@@ -17,11 +17,13 @@ Usage of hlogtop:
     	only those http codes (comma split)
   -cut int
     	cut some caracters from the beginning of each line
+  -format string
+    	date formatting (default "YYYY-MM-DD")
   -group value
     	url group regexp such as [name]=[re]
   -i	invert foreground print color
   -mode string
-    	how to organize hits url|ua (default "url")
+    	how to organize hits url|ua|date (default "url")
   -v	verbose mode
 ```
 
@@ -44,4 +46,12 @@ hlogtop -mode=ua \
 -group="safari=Safari" \
 -group="google_bot=Googlebot" \
 -group="firefox=Firefox"
+
+# mode date
+journalctl --no-tail -f -u [service] \
+hlogtop -mode=date \
+-cut=56 \
+-format="DD Jan YYYY, hhh"
+
+
 ```
